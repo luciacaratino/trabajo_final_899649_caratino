@@ -1,0 +1,587 @@
+# =======================
+#   LIBRERÍAS Y RUTAS
+# =======================
+
+library(shiny)
+library(shinydashboard)
+library(leaflet)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(stringr)
+library(readr)
+library(htmltools)
+library(lubridate)
+
+# === Configurar rutas ===
+base_dir <- getwd()         
+project_dir <- dirname(base_dir) 
+
+instub <- file.path(project_dir, "input")
+
+# === Leer datos ===
+delitos <- read.csv(file.path(instub, "delitos.csv")) %>%
+  mutate(
+    barrio = str_to_upper(str_trim(barrio)),
+    mes = factor(
+      mes,
+      levels = c("ENERO", "FEBRERO", "MARZO", "ABRIL", "MAYO", "JUNIO",
+                 "JULIO", "AGOSTO", "SEPTIEMBRE", "OCTUBRE", "NOVIEMBRE", "DICIEMBRE"),
+      ordered = TRUE
+    ),
+    mes_num = match(mes, levels(mes)),
+    mes_fecha = make_date(year = anio, month = mes_num, day = 1)
+  )
+barrios_caba <- st_read(file.path(instub, "barrios_caba.geojson"))
+
+# Registrar la fuente en Windows para gráficos 
+if (.Platform$OS.type == "windows") {
+  windowsFonts(SegoeUI = windowsFont("Segoe UI"))
+}
+
+#-----------------------------------------------#
+#                  TABLERO                      #
+#-----------------------------------------------#
+
+ui <- dashboardPage(
+  dashboardHeader(title = "Delitos CABA"),
+  dashboardSidebar(
+    selectInput("anio", "Año", choices = c("Todos", sort(unique(delitos$anio)))),
+    selectInput("barrio", "Barrio", choices = c("Todos", sort(unique(delitos$barrio)))),
+    selectInput("tipo", "Tipo de delito", choices = c("Todos", sort(unique(delitos$tipo)))),
+    
+    # Sección condicional para filtros de robo
+    conditionalPanel(
+      condition = "input.tipo == 'Robo' || input.tipo == 'robo'",
+      tags$div(
+        style = "margin-top: 15px; padding: 10px; background-color: #f8f9fa; border-left: 4px solid #007bff; border-radius: 4px;",
+        tags$h5("Filtros específicos de Robo", style = "color: #007bff; margin-bottom: 10px; font-weight: bold;"),
+        tags$div(
+          style = "color: #2c3e50;",
+          selectInput("arma", "Uso de arma", choices = c("Todos", sort(unique(delitos$uso_arma)))),
+          selectInput("moto", "Uso de moto", choices = c("Todos", sort(unique(delitos$uso_moto))))
+        )
+      )
+    ),
+    
+    # Mensaje informativo cuando no es robo
+    conditionalPanel(
+      condition = "input.tipo != 'Todos' && input.tipo != 'Robo' && input.tipo != 'robo'",
+      tags$div(
+        style = "margin-top: 15px; padding: 10px; background-color: #fff3cd; border-left: 4px solid #ffc107; border-radius: 4px;",
+        tags$p("Los filtros de uso de arma y moto solo están disponibles para delitos de tipo 'Robo'", 
+               style = "color: #856404; margin: 0; font-size: 12px;")
+      )
+    )
+  ),
+  dashboardBody(
+    # CSS para la fuente del título del header y estilos adicionales
+    tags$head(
+      tags$style(HTML('
+    .main-header .logo {
+      font-family: "Segoe UI", SegoeUI, Tahoma, Geneva, Verdana, sans-serif !important;
+      font-weight: bold;
+      font-size: 24px;
+      color: #2C3E50;
+    }
+
+    .box-header .box-title {
+      font-family: "Segoe UI", SegoeUI, Tahoma, Geneva, Verdana, sans-serif !important;
+      font-weight: bold !important;
+      font-size: 18px !important;
+      color: #2C3E50 !important;
+    }
+
+    .sidebar .control-label {
+      font-family: "Segoe UI", SegoeUI, Tahoma, Geneva, Verdana, sans-serif !important;
+      font-weight: normal !important;
+      font-size: 14px !important;
+      /* No se fuerza color => usa el predeterminado */
+    }
+    
+    .info-box-content {
+      font-family: "Segoe UI", SegoeUI, Tahoma, Geneva, Verdana, sans-serif !important;
+    }
+    
+    .info-box-text {
+      font-size: 13px !important;
+      font-weight: bold !important;
+      color: #2C3E50 !important;
+    }
+    
+    .info-box-number {
+      font-size: 18px !important;
+      font-weight: bold !important;
+      color: #34495E !important;
+    }
+  '))
+    ),
+    
+    # Fila de cajas informativas
+    fluidRow(
+      infoBoxOutput("horaBox", width = 4),
+      infoBoxOutput("diaBox", width = 4),
+      infoBoxOutput("franjaBox", width = 4)
+    ),
+    
+    # Primera fila: Mapa a la izquierda, gráficos de tops a la derecha
+    fluidRow(
+      # Mapa
+      box(
+        width = 8, 
+        title = "Mapa Dinamico", 
+        status = "primary", 
+        solidHeader = TRUE,
+        leafletOutput("mapa", height = 500)
+      ),
+      # Columna derecha con los dos gráficos de tops
+      column(
+        width = 4,
+        # Top Barrios
+        box(
+          width = NULL, 
+          title = "Top Barrios con Más Delitos", 
+          status = "primary", 
+          solidHeader = TRUE,
+          plotOutput("topBarrios", height = 240)
+        ),
+        # Top Tipos
+        box(
+          width = NULL, 
+          title = "Top Tipos de Delitos", 
+          status = "primary", 
+          solidHeader = TRUE,
+          plotOutput("topTipos", height = 240)
+        )
+      )
+    ),
+    
+    # Segunda fila: Serie de tiempo ocupando todo el ancho
+    fluidRow(
+      box(
+        width = 12, 
+        title = "Evolución Temporal", 
+        status = "primary", 
+        solidHeader = TRUE,
+        plotOutput("serieTiempo", height = 400)
+      )
+    )
+  )
+)
+
+# === Server ===
+server <- function(input, output, session) {
+  
+  # Función mejorada para crear bins consistentes usando pretty()
+  create_smart_bins <- function(max_val, n_bins = 6) {
+    if (max_val == 0) return(c(0, 1))
+    
+    # Usar pretty() que está optimizado para crear escalas visuales atractivas
+    bins <- pretty(c(0, max_val), n = n_bins)
+    
+    # Asegurar que empezamos en 0 y que el máximo está incluido
+    if (bins[1] > 0) {
+      bins <- c(0, bins)
+    }
+    
+    if (max(bins) < max_val) {
+      bins <- c(bins, max(bins) + (bins[2] - bins[1]))
+    }
+    
+    return(bins)
+  }
+  
+  datos_filtrados <- reactive({
+    df <- delitos
+    if (input$anio != "Todos") df <- df %>% filter(anio == as.numeric(input$anio))
+    if (input$barrio != "Todos") df <- df %>% filter(barrio == input$barrio)
+    if (input$tipo != "Todos") df <- df %>% filter(tipo == input$tipo)
+    
+    # Solo aplicar filtros de arma y moto si el tipo es "Robo" y los inputs existen
+    if (input$tipo == "Robo" || input$tipo == "robo") {
+      if (!is.null(input$arma) && input$arma != "Todos") {
+        df <- df %>% filter(uso_arma == input$arma)
+      }
+      if (!is.null(input$moto) && input$moto != "Todos") {
+        df <- df %>% filter(uso_moto == input$moto)
+      }
+    }
+    
+    df
+  })
+  
+  # === Cajas informativas ===
+  output$horaBox <- renderInfoBox({
+    df <- datos_filtrados()
+    
+    # Título dinámico mejorado
+    titulo_dinamico <- if (input$tipo != "Todos") {
+      # Casos especiales donde usamos "delitos de" en lugar de solo el tipo
+      if (tolower(input$tipo) %in% c("vialidad","Vialidad" )) {
+        paste("Hora con más delitos de", input$tipo)
+      } else {
+        # Para otros casos como "Robo", "Hurto", "Homicidio", etc.
+        paste("Hora con mas", input$tipo)
+      }
+    } else {
+      "Hora con Más Delitos"
+    }
+    
+    if (nrow(df) == 0) {
+      hora_top <- "Sin datos"
+      cantidad_hora <- 0
+    } else {
+      hora_stats <- df %>%
+        group_by(franja) %>%
+        summarise(total = sum(cantidad, na.rm = TRUE), .groups = "drop") %>%
+        arrange(desc(total))
+      
+      if (nrow(hora_stats) > 0) {
+        hora_top <- paste0(hora_stats$franja[1], ":00 hs")
+        cantidad_hora <- hora_stats$total[1]
+      } else {
+        hora_top <- "Sin datos"
+        cantidad_hora <- 0
+      }
+    }
+    
+    infoBox(
+      title = titulo_dinamico,
+      value = hora_top,
+      subtitle = paste("Total:", format(cantidad_hora, big.mark = ".", decimal.mark = ",")),
+      icon = icon("clock"),
+      color = "blue"
+    )
+  })
+  
+  output$diaBox <- renderInfoBox({
+    df <- datos_filtrados()
+    
+    # Título dinámico mejorado
+    titulo_dinamico <- if (input$tipo != "Todos") {
+      # Casos especiales donde usamos "delitos de" en lugar de solo el tipo
+      if (tolower(input$tipo) %in% c("vialidad", "narcotrafico", "narcotráfico")) {
+        paste("Día con Más Delitos de", input$tipo)
+      } else {
+        # Para otros casos como "Robo", "Hurto", "Homicidio", etc.
+        paste("Día con Más", input$tipo)
+      }
+    } else {
+      "Día con Más Delitos"
+    }
+    
+    if (nrow(df) == 0) {
+      dia_top <- "Sin datos"
+      cantidad_dia <- 0
+    } else {
+      dia_stats <- df %>%
+        group_by(dia) %>%
+        summarise(total = sum(cantidad, na.rm = TRUE), .groups = "drop") %>%
+        arrange(desc(total))
+      
+      if (nrow(dia_stats) > 0) {
+        dia_top <- dia_stats$dia[1]
+        cantidad_dia <- dia_stats$total[1]
+      } else {
+        dia_top <- "Sin datos"
+        cantidad_dia <- 0
+      }
+    }
+    
+    infoBox(
+      title = titulo_dinamico,
+      value = dia_top,
+      subtitle = paste("Total:", format(cantidad_dia, big.mark = ".", decimal.mark = ",")),
+      icon = icon("calendar-day"),
+      color = "green"
+    )
+  })
+  
+  output$franjaBox <- renderInfoBox({
+    df <- datos_filtrados()
+    
+    # Título dinámicos
+    titulo_dinamico <- if (input$tipo != "Todos") {
+      # Casos especiales donde usamos "delitos de" en lugar de solo el tipo
+      if (tolower(input$tipo) %in% c("vialidad", "narcotrafico", "narcotráfico")) {
+        paste("Mes con Más Delitos de", input$tipo)
+      } else {
+        # Para otros casos como "Robo", "Hurto", "Homicidio", etc.
+        paste("Mes con Más", input$tipo)
+      }
+    } else {
+      "Mes con Más Delitos"
+    }
+    
+    if (nrow(df) == 0) {
+      mes_top <- "Sin datos"
+      cantidad_mes <- 0
+    } else {
+      mes_stats <- df %>%
+        group_by(mes) %>%
+        summarise(total = sum(cantidad, na.rm = TRUE), .groups = "drop") %>%
+        arrange(desc(total))
+      
+      if (nrow(mes_stats) > 0) {
+        mes_top <- mes_stats$mes[1]
+        cantidad_mes <- mes_stats$total[1]
+      } else {
+        mes_top <- "Sin datos"
+        cantidad_mes <- 0
+      }
+    }
+    
+    infoBox(
+      title = titulo_dinamico,
+      value = mes_top,
+      subtitle = paste("Total:", format(cantidad_mes, big.mark = ".", decimal.mark = ",")),
+      icon = icon("calendar"),
+      color = "yellow"
+    )
+  })
+  
+  output$mapa <- renderLeaflet({
+    leaflet(datos_filtrados(), options = leafletOptions(minZoom = 11, maxZoom = 18)) %>%
+      addTiles() %>%
+      setView(lng = -58.445, lat = -34.62, zoom = 11) %>%
+      setMaxBounds(lng1 = -58.56, lat1 = -34.64, lng2 = -58.30, lat2 = -34.59)
+  })
+  
+  observe({
+    df <- datos_filtrados()
+    
+    # CORRECCIÓN: Mantener escala global cuando se filtra solo por barrio
+    df_para_escala <- delitos
+    
+    # Solo aplicar filtros de año y tipo para la escala, NO el filtro de barrio
+    if (input$anio != "Todos") df_para_escala <- df_para_escala %>% filter(anio == as.numeric(input$anio))
+    if (input$tipo != "Todos") df_para_escala <- df_para_escala %>% filter(tipo == input$tipo)
+    
+    # Verificar si se usan filtros específicos de robo para la escala
+    if (input$tipo == "Robo" || input$tipo == "robo") {
+      if ((!is.null(input$arma) && input$arma != "Todos") || 
+          (!is.null(input$moto) && input$moto != "Todos")) {
+        # Aplicar también estos filtros para la escala
+        if (!is.null(input$arma) && input$arma != "Todos") {
+          df_para_escala <- df_para_escala %>% filter(uso_arma == input$arma)
+        }
+        if (!is.null(input$moto) && input$moto != "Todos") {
+          df_para_escala <- df_para_escala %>% filter(uso_moto == input$moto)
+        }
+      }
+    }
+    
+    # Calcular la escala basada en TODOS los barrios con los filtros aplicados (excepto barrio)
+    escala_global <- df_para_escala %>%
+      group_by(barrio) %>%
+      summarise(cantidad = sum(cantidad, na.rm = TRUE), .groups = "drop")
+    
+    # Los datos mostrados son siempre los completamente filtrados (incluye filtro de barrio)
+    delitos_suma <- df %>%
+      group_by(barrio) %>%
+      summarise(cantidad = sum(cantidad, na.rm = TRUE), .groups = "drop")
+    
+    datos <- right_join(barrios_caba, delitos_suma, by = c("nombre" = "barrio")) %>%
+      mutate(cantidad = ifelse(is.na(cantidad), 0, cantidad)) %>%
+      st_as_sf()
+    
+    # Usar el máximo de la escala global (todos los barrios) para mantener consistencia
+    max_val <- max(escala_global$cantidad, na.rm = TRUE)
+    
+    # Crear bins consistentes usando la nueva función mejorada
+    bins <- create_smart_bins(max_val)
+    
+    paleta <- colorBin(
+      palette = c("#FFF5F0", "#FEE0D2", "#FCBBA1", "#FC9272", "#FB6A4A", "#EF3B2C", "#CB181D", "#99000D"),
+      domain = c(0, max_val),
+      bins = bins,
+      na.color = "#F0F0F0"
+    )
+    
+    labels <- paste0(
+      "<strong style='font-size: 14px;'>", datos$nombre, "</strong><br/>",
+      "<span style='color: #666;'>Cantidad de delitos: <strong>",
+      format(datos$cantidad, big.mark = ".", decimal.mark = ","), "</strong></span>"
+    )
+    
+    leafletProxy("mapa", data = datos) %>%
+      clearShapes() %>%
+      addPolygons(
+        fillColor = ~paleta(cantidad),
+        color = "white",
+        weight = 1.5,
+        opacity = 1,
+        fillOpacity = 0.8,
+        label = lapply(labels, HTML),
+        highlight = highlightOptions(
+          weight = 3,
+          color = "#2c3e50",
+          fillOpacity = 0.9,
+          bringToFront = TRUE
+        )
+      ) %>%
+      clearControls() %>%
+      addLegend(
+        "bottomright",
+        pal = paleta,
+        values = c(0, max_val),
+        title = HTML("<strong>Cantidad de delitos</strong>"),
+        opacity = 0.9
+      )
+  })
+  
+  output$serieTiempo <- renderPlot({
+    df <- datos_filtrados() %>%
+      group_by(mes_fecha) %>%
+      summarise(total_delitos = sum(cantidad, na.rm = TRUE)) %>%
+      arrange(mes_fecha)
+    
+    if (nrow(df) == 0) {
+      plot.new()
+      text(0.5, 0.5, "No hay datos para los filtros seleccionados", cex = 1.5)
+    } else {
+      max_y <- max(df$total_delitos, na.rm = TRUE)
+      if (max_y == 0) max_y <- 1
+      breaks_y <- pretty(c(0, max_y), n = 4)
+      
+      ggplot(df, aes(x = mes_fecha, y = total_delitos)) +
+        geom_area(fill = "#FCBBA1", alpha = 0.3) +
+        geom_line(color = "#CB181D", size = 1.1, alpha = 0.6) +
+        geom_point(color = "#2c3e50", size = 1.3, alpha = 0.7) +
+        scale_y_continuous(
+          limits = c(0, max(breaks_y)),
+          breaks = breaks_y
+        ) +
+        scale_x_date(
+          date_breaks = "3 months",
+          date_labels = "%b %Y"
+        ) +
+        labs(
+          title = "",
+          x = "Mes",
+          y = "Total delitos"
+        ) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(angle = 45, hjust = 1, family = "Segoe UI", size = 9, color = "#2C3E50"),
+          axis.text.y = element_text(family = "Segoe UI", size = 9, color = "#2C3E50"),
+          axis.title.x = element_text(family = "Segoe UI", size = 12, color = "#34495E", face = "bold"),
+          axis.title.y = element_text(family = "Segoe UI", size = 12, color = "#34495E", face = "bold"),
+          plot.title = element_text(family = "Segoe UI", size = 18, face = "bold", hjust = 0.5, color = "#2C3E50"),
+          panel.grid.major = element_line(color = "#ECF0F1", size = 0.5),
+          panel.grid.minor = element_line(color = "#F8F9FA", size = 0.3),
+          plot.background = element_rect(fill = "#ECF0F1", color = NA),
+          panel.background = element_rect(fill = "#F8F9FA", color = NA),
+          axis.line = element_line(color = "#BDC3C7", size = 0.5)
+        )
+    }
+  })
+  
+  # === Top Barrios ===
+  output$topBarrios <- renderPlot({
+    # Para el top de barrios, solo aplicamos filtros de año y tipo (no barrio específico)
+    df <- delitos
+    if (input$anio != "Todos") df <- df %>% filter(anio == as.numeric(input$anio))
+    if (input$tipo != "Todos") df <- df %>% filter(tipo == input$tipo)
+    
+    # Aplicar filtros específicos de robo si aplican
+    if (input$tipo == "Robo" || input$tipo == "robo") {
+      if (!is.null(input$arma) && input$arma != "Todos") {
+        df <- df %>% filter(uso_arma == input$arma)
+      }
+      if (!is.null(input$moto) && input$moto != "Todos") {
+        df <- df %>% filter(uso_moto == input$moto)
+      }
+    }
+    
+    top_barrios <- df %>%
+      group_by(barrio) %>%
+      summarise(total_delitos = sum(cantidad, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(total_delitos)) %>%
+      head(8) %>%  # Reducido a 8 para mejor ajuste visual
+      mutate(barrio = factor(barrio, levels = rev(barrio))) # Para ordenar en el gráfico
+    
+    if (nrow(top_barrios) == 0) {
+      plot.new()
+      text(0.5, 0.5, "No hay datos para los filtros seleccionados", cex = 1)
+    } else {
+      ggplot(top_barrios, aes(x = barrio, y = total_delitos)) +
+        geom_col(fill = "#CB181D", alpha = 0.8, width = 0.7) +
+        geom_text(aes(label = format(total_delitos, big.mark = ".", decimal.mark = ",")), 
+                  hjust = -0.1, size = 3, color = "#2c3e50", fontface = "bold") +
+        coord_flip() +
+        scale_y_continuous(
+          expand = expansion(mult = c(0, 0.15)),
+          labels = function(x) format(x, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+        ) +
+        labs(
+          title = "Top 8 Barrios",
+          x = "",
+          y = "Total de Delitos"
+        ) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(family = "SegoeUI", size = 7, color = "#2C3E50", angle = 0),
+          axis.text.y = element_text(family = "SegoeUI", size = 11, color = "#2C3E50"),
+          axis.title.x = element_text(family = "SegoeUI", size = 10, color = "#34495E", face = "bold"),
+          plot.title = element_text(family = "SegoeUI", size = 12, face = "bold", hjust = 0.5, color = "#2C3E50"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(color = "#ECF0F1", size = 0.5),
+          plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.margin = margin(5, 5, 5, 5)
+        )
+    }
+  })
+  
+  # === Top Tipos de Delitos ===
+  output$topTipos <- renderPlot({
+    # Para el top de tipos, aplicamos filtros de año y barrio (no tipo específico)
+    datos <- delitos
+    if (input$anio != "Todos") datos <- datos %>% filter(anio == as.numeric(input$anio))
+    if (input$barrio != "Todos") datos <- datos %>% filter(barrio == input$barrio)
+    
+    top_tipos <- datos %>%
+      group_by(tipo) %>%
+      summarise(total_delitos = sum(cantidad, na.rm = TRUE), .groups = "drop") %>%
+      arrange(desc(total_delitos)) %>%
+      head(8) %>%  # Reducido a 8 para mejor ajuste visual
+      mutate(tipo = factor(tipo, levels = rev(tipo))) # Para ordenar en el gráfico
+    
+    if (nrow(top_tipos) == 0) {
+      plot.new()
+      text(0.5, 0.5, "No hay datos para los filtros seleccionados", cex = 1)
+    } else {
+      ggplot(top_tipos, aes(x = tipo, y = total_delitos)) +
+        geom_col(fill = "#2E86AB", alpha = 0.8, width = 0.7) +
+        geom_text(aes(label = format(total_delitos, big.mark = ".", decimal.mark = ",")), 
+                  hjust = -0.1, size = 3, color = "#2c3e50", fontface = "bold") +
+        coord_flip() +
+        scale_y_continuous(
+          expand = expansion(mult = c(0, 0.15)),
+          labels = function(x) format(x, big.mark = ".", decimal.mark = ",", scientific = FALSE)
+        ) +
+        labs(
+          title = "Top 8 Tipos de Delitos",
+          x = "",
+          y = "Total de Delitos"
+        ) +
+        theme_minimal() +
+        theme(
+          axis.text.x = element_text(family = "SegoeUI", size = 8, color = "#2C3E50"),
+          axis.text.y = element_text(family = "SegoeUI", size = 11, color = "#2C3E50"),
+          axis.title.x = element_text(family = "SegoeUI", size = 10, color = "#34495E", face = "bold"),
+          plot.title = element_text(family = "SegoeUI", size = 12, face = "bold", hjust = 0.5, color = "#2C3E50"),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.grid.major.x = element_line(color = "#ECF0F1", size = 0.5),
+          plot.background = element_rect(fill = "white", color = NA),
+          panel.background = element_rect(fill = "white", color = NA),
+          plot.margin = margin(5, 5, 5, 5)
+        )
+    }
+  })
+}
+
+shinyApp(ui, server)
