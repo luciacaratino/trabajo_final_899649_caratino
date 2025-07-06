@@ -7,6 +7,6 @@ Informacion de los scripts
 
 03_graficos: con delitos.csv genera tablas y gráficos para la presentación se guardan en output
 
-04_tablero_dinamico: genera el tablero partiendo de delitos_csv
+04_tablero_dinamico: genera el tablero partiendo de delitos.csv
 
 05_tablero_dinamico_presentacion: genera el mismo tablero pero con los colores usados en la presentacion
